@@ -24,34 +24,56 @@ class Settings:
 
 	# Database
 	database_url: str = get_env("DATABASE_URL")
-	activity_table: str = get_env("ACTIVITY_TABLE")
-	activity_timestamp_column: str = os.getenv("ACTIVITY_TIMESTAMP_COLUMN", "updated_at")
 
 	# Monitor
 	check_interval_seconds: int = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
-	inactivity_threshold_minutes: int = int(os.getenv("INACTIVITY_THRESHOLD_MINUTES", "10"))
-	alert_cooldown_minutes: int = int(os.getenv("ALERT_COOLDOWN_MINUTES", "30"))
-
-	# Email (SMTP) - Optional
-	smtp_host: str = os.getenv("SMTP_HOST", "")
-	smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
-	smtp_user: str = os.getenv("SMTP_USER", "")
-	smtp_password: str = os.getenv("SMTP_PASSWORD", "")
-	smtp_use_tls: bool = os.getenv("SMTP_USE_TLS", "true").lower() in {"1", "true", "yes", "on"}
-	smtp_use_ssl: bool = os.getenv("SMTP_USE_SSL", "false").lower() in {"1", "true", "yes", "on"}
-	mail_sender: str = os.getenv("MAIL_SENDER", "")
-	mail_recipients: list[str] = [r.strip() for r in os.getenv("MAIL_RECIPIENTS", "").split(",") if r.strip()]
+	alert_cooldown_minutes: int = int(os.getenv("ALERT_COOLDOWN_MINUTES", "10"))
 	
-	# Teams - Primary notification method
-	teams_webhook_url: str = os.getenv("TEAMS_WEBHOOK_URL", "")
-	enable_teams_notifications: bool = os.getenv("ENABLE_TEAMS_NOTIFICATIONS", "true").lower() in {"1", "true", "yes", "on"}
-	enable_email_notifications: bool = os.getenv("ENABLE_EMAIL_NOTIFICATIONS", "false").lower() in {"1", "true", "yes", "on"}
-
-	def inactivity_timedelta(self) -> timedelta:
-		return timedelta(minutes=self.inactivity_threshold_minutes)
-
-	def alert_cooldown_timedelta(self) -> timedelta:
-		return timedelta(minutes=self.alert_cooldown_minutes)
+	# Stored procedure mode only
+	check_mode: str = "stored_procedure"
+	
+	# Stored procedure configuration - flexible for multiple procedures
+	sp_ok_value: str = os.getenv("SP_OK_VALUE", "OK")
+	
+	# Multiple stored procedures configuration
+	# Format: "procedure1:col1|col2,procedure2:colA|colB"
+	# Example: "dbo.usp_CheckUpdateStatus:HotelUpdateStatus|ChannelStatsStatus"
+	sp_procedures: str = os.getenv(
+		"SP_PROCEDURES",
+		"dbo.usp_CheckUpdateStatus:HotelUpdateStatus|ChannelStatsStatus",
+	)
+	
+	def get_sp_config(self) -> list[dict[str, list[str]]]:
+		"""
+		Parse stored procedure configuration into a list of dictionaries.
+		Returns: [{"procedure": "dbo.usp_CheckUpdateStatus", "columns": ["HotelUpdateStatus", "ChannelStatsStatus"]}, ...]
+		"""
+		procedures: list[dict[str, list[str]]] = []
+		if not self.sp_procedures.strip():
+			return procedures
+		
+		for item in self.sp_procedures.split(','):
+			item = item.strip()
+			if not item:
+				continue
+			if ':' in item:
+				procedure, columns_str = item.split(':', 1)
+				columns = [c.strip() for c in columns_str.split('|') if c.strip()]
+				if not columns:
+					# Fallback: derive a single column name from the procedure
+					columns = [procedure.strip().split('.')[-1]]
+				procedures.append({
+					"procedure": procedure.strip(),
+					"columns": columns,
+				})
+			else:
+				# Fallback: use procedure name as single column
+				procedures.append({
+					"procedure": item.strip(),
+					"columns": [item.strip().split('.')[-1]],
+				})
+		
+		return procedures
 
 
 settings = Settings()

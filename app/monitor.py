@@ -4,10 +4,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from dateutil import parser as date_parser
-
 from .config import settings
-from .db import fetch_latest_timestamp
+from .db import fetch_sp_statuses
 from .emailer import send_alert_email
 from .teams_notifier import send_teams_notification
 
@@ -19,43 +17,38 @@ class ActivityMonitor:
 		self._last_alert_at_utc: Optional[datetime] = None
 
 	async def check_and_alert(self) -> dict:
-		"""Check the latest row timestamp and send an alert if inactive too long."""
+		"""Check stored procedure status and send an alert if needed."""
 		try:
-			has_row, latest_iso = await fetch_latest_timestamp()
-			now = datetime.now(timezone.utc)
-
-			if not has_row:
-				logger.info("No rows found in activity table")
-				return {"status": "no_rows", "now": now.isoformat()}
-
-			latest_dt = self._to_utc(latest_iso)
-			inactive_for = now - latest_dt
-			threshold = settings.inactivity_timedelta()
-
-			logger.debug(f"Last activity: {latest_dt}, Inactive for: {inactive_for}, Threshold: {threshold}")
-
-			if inactive_for >= threshold:
-				if not self._is_in_cooldown(now):
-					logger.warning(f"Database inactive for {inactive_for}, sending alert")
-					await self._send_inactivity_alert(latest_dt, inactive_for, threshold)
-					self._last_alert_at_utc = now
-					return {
-						"status": "alert_sent",
-						"inactive_for_seconds": int(inactive_for.total_seconds()),
-					}
-				logger.info(f"Alert in cooldown until {self._cooldown_until()}")
-				return {"status": "cooldown", "cooldown_until": self._cooldown_until().isoformat()}
-
-			return {"status": "ok", "inactive_for_seconds": int(inactive_for.total_seconds())}
+			return await self._check_stored_procedure()
 		except Exception as e:
 			logger.error(f"Error during database check: {e}", exc_info=True)
 			return {"status": "error", "error": str(e)}
 
-	def _to_utc(self, ts: str) -> datetime:
-		parsed = date_parser.parse(ts)
-		if parsed.tzinfo is None:
-			parsed = parsed.replace(tzinfo=timezone.utc)
-		return parsed.astimezone(timezone.utc)
+	async def _check_stored_procedure(self) -> dict:
+		"""Check stored procedure status and send an alert if any status is not OK."""
+		now = datetime.now(timezone.utc)
+		statuses = await fetch_sp_statuses()
+		
+		logger.debug(f"Stored procedure statuses: {statuses}")
+		
+		# Check if all statuses are OK
+		all_ok = all(status == settings.sp_ok_value for status in statuses.values())
+		
+		if all_ok:
+			return {"status": "ok", "statuses": statuses}
+		
+		# Some status is not OK, check if we should send alert
+		if not self._is_in_cooldown(now):
+			logger.warning(f"Stored procedure check failed: {statuses}, sending alert")
+			await self._send_sp_alert(statuses)
+			self._last_alert_at_utc = now
+			return {
+				"status": "alert_sent",
+				"statuses": statuses,
+			}
+		
+		logger.info(f"Alert in cooldown until {self._cooldown_until()}")
+		return {"status": "cooldown", "cooldown_until": self._cooldown_until().isoformat(), "statuses": statuses}
 
 	def _is_in_cooldown(self, now: datetime) -> bool:
 		if self._last_alert_at_utc is None:
@@ -66,16 +59,27 @@ class ActivityMonitor:
 		assert self._last_alert_at_utc is not None
 		return self._last_alert_at_utc + settings.alert_cooldown_timedelta()
 
-	async def _send_inactivity_alert(self, last_update: datetime, inactive_for, threshold) -> None:
-		title = f"⚠️ Database Inactivity Alert - {int(threshold.total_seconds()//60)} minutes"
+	async def _send_sp_alert(self, statuses: dict[str, str]) -> None:
+		"""Send alert for stored procedure check failure."""
+		title = "⚠️ Database Update Health Check Failed"
+		
+		# Build status details
+		status_details = []
+		for key, value in statuses.items():
+			status_icon = "✅" if value == settings.sp_ok_value else "❌"
+			status_details.append(f"**{key}:** {status_icon} {value}")
+		
+		# Get procedure names from configuration
+		sp_config = settings.get_sp_config()
+		procedure_names = [config["procedure"] for config in sp_config]
+		procedures_text = ", ".join(procedure_names) if procedure_names else "No procedures configured"
+		
 		message = (
-			f"Database activity monitor detected inactivity.\n\n"
-			f"**Activity table:** {settings.activity_table}\n"
-			f"**Timestamp column:** {settings.activity_timestamp_column}\n"
-			f"**Last update (UTC):** {last_update.isoformat()}\n"
-			f"**Inactive for:** {inactive_for}\n"
-			f"**Threshold:** {threshold}\n\n"
-			f"Please check the database for any issues."
+			f"Database update health check failed.\n\n"
+			f"**Stored Procedures:** {procedures_text}\n"
+			f"**Expected OK Value:** {settings.sp_ok_value}\n\n"
+			f"**Status Results:**\n" + "\n".join(status_details) + "\n\n"
+			f"Please check the database update processes for any issues."
 		)
 		
 		# Try Teams notification first (primary method)
@@ -89,14 +93,17 @@ class ActivityMonitor:
 		
 		# Fallback to email if Teams fails or is disabled
 		if settings.enable_email_notifications:
-			subject = f"DB inactivity alert: no updates in {int(threshold.total_seconds()//60)} min"
+			subject = "Database Update Health Check Failed"
+			# Get procedure names from configuration
+			sp_config = settings.get_sp_config()
+			procedure_names = [config["procedure"] for config in sp_config]
+			procedures_text = ", ".join(procedure_names) if procedure_names else "No procedures configured"
+			
 			body = (
-				"Database activity monitor detected inactivity.\n\n"
-				f"Activity table: {settings.activity_table}\n"
-				f"Timestamp column: {settings.activity_timestamp_column}\n"
-				f"Last update (UTC): {last_update.isoformat()}\n"
-				f"Inactive for: {inactive_for}\n"
-				f"Threshold: {threshold}\n"
+				"Database update health check failed.\n\n"
+				f"Stored Procedures: {procedures_text}\n"
+				f"Expected OK Value: {settings.sp_ok_value}\n\n"
+				"Status Results:\n" + "\n".join([f"{key}: {value}" for key, value in statuses.items()]) + "\n"
 			)
 			try:
 				await send_alert_email(subject, body)
